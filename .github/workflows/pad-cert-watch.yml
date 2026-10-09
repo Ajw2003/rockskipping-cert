@@ -1,0 +1,208 @@
+name: Watch the pad certificate
+
+# Keeps the shared certificate for AJ's Motion Controls (pad.skiprocking.ca and
+# its spare names) valid. Each run checks the published certificate against its
+# revocation list and expiry, reissues it with a brand-new key when it is
+# revoked, expiring, unusable or missing, then starts the next run about an hour
+# later. Decision record: Ajw2003/AJ-s-motionControls docs/6-decisions/Decisions.md,
+# 2026-10-09. Issues #17 and #18 in that repo.
+#
+# There is no `schedule:` trigger here, because GitHub's schedule is unreliable
+# (Ajw2003/CannaScraper saw its hourly schedule fire once in about 12 hours).
+# The `next` job dispatches the following run, and pad-cert-watchdog.yml
+# restarts the chain if it ever stops.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: >-
+          production publishes to the pad-current release that launchers download.
+          staging issues an untrusted test certificate to pad-staging and does not
+          start the hourly chain.
+        type: choice
+        options: [production, staging]
+        default: production
+      force:
+        description: Issue even if the published certificate is fine.
+        type: boolean
+        default: false
+
+# One issuing run at a time, so two runs can never both decide to reissue.
+concurrency:
+  group: pad-cert-issue
+  cancel-in-progress: false
+
+env:
+  PAD_NAMES: pad.skiprocking.ca pad2.skiprocking.ca pad3.skiprocking.ca
+  # Renew once fewer days than this remain. Let's Encrypt issues for 90 days
+  # today (64 from February 2027, 45 from February 2028), so 30 leaves time for
+  # offline PCs to pick up the new certificate.
+  RENEW_WHEN_DAYS_BELOW: '30'
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write     # create the release and upload pad-cert.json
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve run settings
+        id: cfg
+        run: |
+          set -euo pipefail
+          # A chained run carries no inputs, so everything falls back to production.
+          MODE="${{ github.event.inputs.environment || 'production' }}"
+          FORCE="${{ github.event.inputs.force || 'false' }}"
+          if [ "$MODE" = "staging" ]; then
+            echo "server=letsencrypt_test" >> "$GITHUB_OUTPUT"
+            echo "tag=pad-staging" >> "$GITHUB_OUTPUT"
+          else
+            echo "server=letsencrypt" >> "$GITHUB_OUTPUT"
+            echo "tag=pad-current" >> "$GITHUB_OUTPUT"
+          fi
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "force=$FORCE" >> "$GITHUB_OUTPUT"
+
+      - name: Check the published certificate
+        id: check
+        env:
+          TAG: ${{ steps.cfg.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p current
+          if ! gh release download "$TAG" --pattern pad-cert.json --dir current --clobber 2>err.txt; then
+            echo "No pad-cert.json on $TAG ($(cat err.txt))"
+            echo "reason=missing" >> "$GITHUB_OUTPUT"
+            echo "name=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! ci/unbundle_cert.sh current/pad-cert.json current; then
+            echo "reason=invalid" >> "$GITHUB_OUTPUT"
+            echo "name=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "name=$(cat current/name)" >> "$GITHUB_OUTPUT"
+          rc=0
+          ci/check_cert.sh current/chain.pem --min-days "$RENEW_WHEN_DAYS_BELOW" > status.txt || rc=$?
+          cat status.txt
+          case "$rc" in
+            0)  echo "reason=ok" >> "$GITHUB_OUTPUT" ;;
+            10) echo "reason=revoked" >> "$GITHUB_OUTPUT" ;;
+            11) echo "reason=expiring" >> "$GITHUB_OUTPUT" ;;
+            *)  echo "reason=unreadable" >> "$GITHUB_OUTPUT" ;;
+          esac
+          echo "**$TAG:** $(cat status.txt)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Decide whether to issue
+        id: decide
+        env:
+          REASON: ${{ steps.check.outputs.reason }}
+          CURRENT: ${{ steps.check.outputs.name }}
+          MODE: ${{ steps.cfg.outputs.mode }}
+          FORCE: ${{ steps.cfg.outputs.force }}
+        run: |
+          set -euo pipefail
+          issue=false
+          case "$REASON" in
+            revoked|expiring|invalid|missing) issue=true; why="$REASON" ;;
+            ok) why=ok ;;
+            # The revocation list couldn't be fetched or verified. That is usually
+            # Let's Encrypt's side, and reissuing every hour for it would burn the
+            # weekly limit, so warn and try again next run.
+            unreadable)
+              echo "::warning::Could not check revocation this run; not reissuing for that alone."
+              why=unreadable ;;
+          esac
+          if [ "$issue" = false ] && { [ "$FORCE" = true ] || [ "$MODE" = staging ]; }; then
+            issue=true; why=expiring   # forced or a staging rehearsal: same name
+          fi
+          echo "issue=$issue" >> "$GITHUB_OUTPUT"
+          if [ "$issue" = true ]; then
+            name=$(ci/pick_name.sh "$CURRENT" "$why")
+            echo "name=$name" >> "$GITHUB_OUTPUT"
+            echo "Issuing for $name (reason: $REASON, force: $FORCE, mode: $MODE)" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Nothing to issue (reason: $REASON)." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Unpinned, as in RockSkipping's renew-cert.yml: a guessed tag would break
+      # issuing, which is worse than tracking upstream.
+      - name: Install acme.sh
+        if: steps.decide.outputs.issue == 'true'
+        run: |
+          set -euo pipefail
+          curl -s https://get.acme.sh | sh -s email=noreply@skiprocking.ca
+          echo "$HOME/.acme.sh" >> "$GITHUB_PATH"
+
+      # No acme.sh state survives between runs, so every issue makes a new key.
+      # That is deliberate: a revoked or blocklisted key never comes back.
+      - name: Issue the certificate (DNS-01 through Porkbun)
+        if: steps.decide.outputs.issue == 'true'
+        env:
+          PORKBUN_API_KEY: ${{ secrets.PORKBUN_API_KEY }}
+          PORKBUN_SECRET_API_KEY: ${{ secrets.PORKBUN_SECRET_API_KEY }}
+          NAME: ${{ steps.decide.outputs.name }}
+          SERVER: ${{ steps.cfg.outputs.server }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PORKBUN_API_KEY" ] || [ -z "$PORKBUN_SECRET_API_KEY" ]; then
+            echo "::error::PORKBUN_API_KEY / PORKBUN_SECRET_API_KEY are not set on this repo."
+            exit 1
+          fi
+          "$HOME/.acme.sh/acme.sh" --issue --dns dns_porkbun -d "$NAME" \
+            --server "$SERVER" --keylength ec-256
+          mkdir -p out
+          "$HOME/.acme.sh/acme.sh" --install-cert -d "$NAME" --ecc \
+            --fullchain-file "$PWD/out/chain.pem" --key-file "$PWD/out/key.pem"
+
+      - name: Check and pack the new certificate
+        if: steps.decide.outputs.issue == 'true'
+        env:
+          NAME: ${{ steps.decide.outputs.name }}
+          MODE: ${{ steps.cfg.outputs.mode }}
+        run: ci/bundle_cert.sh out/chain.pem out/key.pem "$NAME" "$MODE" out/pad-cert.json
+
+      # A release asset rather than a committed file: never in git history, and
+      # GitHub's secret scanning doesn't block it. The key is public by design;
+      # see the decision record.
+      - name: Publish
+        if: steps.decide.outputs.issue == 'true'
+        env:
+          TAG: ${{ steps.cfg.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
+            gh release create "$TAG" --title "Pad certificate ($TAG)" \
+              --notes "Published by pad-cert-watch.yml. The private key here is public by design."
+          fi
+          gh release upload "$TAG" out/pad-cert.json --clobber
+          echo "Published pad-cert.json to $TAG" >> "$GITHUB_STEP_SUMMARY"
+
+  # Starts the next run about an hour after this one began, pass or fail, and
+  # makes sure the watchdog is alive. Only on main, and never after a staging
+  # rehearsal, so a test run can't start the hourly chain by accident.
+  next:
+    needs: watch
+    if: always() && github.ref == 'refs/heads/main' && github.event.inputs.environment != 'staging'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      actions: write
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # GitHub turns off a workflow's schedule after 60 days with no repository
+      # activity. This chain runs by dispatch, so it keeps going; switching the
+      # watchdog back on each run means its schedule can never stay off.
+      - name: Keep the watchdog enabled
+        run: gh workflow enable pad-cert-watchdog.yml
+
+      - run: ci/chain_next.sh
