@@ -19,6 +19,8 @@ out="$(DNS_CREDENTIALS=$'A=1\n\nbad key=secretvalue\n' "$HERE/load_dns_credentia
   && pass "bad key fails naming line 3, value not printed" || fail "bad key: $out"
 out="$(DNS_CREDENTIALS=$'NOEQUALS' "$HERE/load_dns_credentials.sh" 2>&1)"; rc=$?
 [ $rc != 0 ] && grep -q 'line 1' <<<"$out" && pass "line without = fails" || fail "no equals: $out"
+out="$(DNS_CREDENTIALS=$'CF_Token=t1\nCF_Zone_ID=z1' "$HERE/load_dns_credentials.sh" 2>&1)"
+grep -q 'export CF_Token=t1' <<<"$out" && grep -q 'export CF_Zone_ID=z1' <<<"$out" && pass "mixed-case Cloudflare names load" || fail "cloudflare: $out"
 out="$(PORKBUN_API_KEY=k1 PORKBUN_SECRET_API_KEY=s1 "$HERE/load_dns_credentials.sh" 2>&1)"
 grep -q 'export PORKBUN_API_KEY=k1' <<<"$out" && pass "porkbun fallback" || fail "fallback: $out"
 out="$(env -u DNS_CREDENTIALS -u PORKBUN_API_KEY -u PORKBUN_SECRET_API_KEY "$HERE/load_dns_credentials.sh" 2>&1)"; rc=$?

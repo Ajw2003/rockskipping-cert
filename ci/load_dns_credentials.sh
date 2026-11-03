@@ -22,8 +22,9 @@ if [ -n "${DNS_CREDENTIALS:-}" ]; then
     line="${line%$'\r'}"
     case "$line" in ''|'#'*) continue ;; esac
     key="${line%%=*}"
-    if [ "$key" = "$line" ] || ! [[ "$key" =~ ^[A-Z_][A-Z0-9_]*$ ]]; then
-      echo "::error::DNS_CREDENTIALS line $n is not KEY=value with KEY in capitals, digits and underscores."
+    # Mixed case is allowed: acme.sh's Cloudflare plugin reads CF_Token and CF_Zone_ID.
+    if [ "$key" = "$line" ] || ! [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+      echo "::error::DNS_CREDENTIALS line $n is not KEY=value with KEY made of letters, digits and underscores."
       exit 1
     fi
     val="${line#*=}"
