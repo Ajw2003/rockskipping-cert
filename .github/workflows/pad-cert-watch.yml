@@ -1,7 +1,13 @@
 name: Watch the pad certificate
 
-# Keeps the shared certificate for AJ's Motion Controls (pad.skiprocking.ca and
-# its spare names) valid. Each run checks the published certificate against its
+# Template workflow: keeps a shared certificate for pad.<DOMAIN> (and the spare
+# names pad2/pad3) valid. Settings: repository variables DOMAIN (default
+# skiprocking.ca), DNS_PLUGIN (default dns_porkbun), ACME_EMAIL (default
+# noreply@skiprocking.ca); secret DNS_CREDENTIALS (KEY=value lines for the DNS
+# plugin) or, for Porkbun, PORKBUN_API_KEY and PORKBUN_SECRET_API_KEY. The
+# copy must be public. Originally AJ's Motion Controls (pad.skiprocking.ca).
+#
+# Each run checks the published certificate against its
 # revocation list and expiry, reissues it with a brand-new key when it is
 # revoked, expiring, unusable or missing, then starts the next run about an hour
 # later. Decision record: Ajw2003/AJ-s-motionControls docs/6-decisions/Decisions.md,
@@ -34,7 +40,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  PAD_NAMES: pad.skiprocking.ca pad2.skiprocking.ca pad3.skiprocking.ca
+  PAD_NAMES: ${{ format('pad.{0} pad2.{0} pad3.{0}', vars.DOMAIN || 'skiprocking.ca') }}
   # Renew once fewer days than this remain. Let's Encrypt issues for 90 days
   # today (64 from February 2027, 45 from February 2028), so 30 leaves time for
   # offline PCs to pick up the new certificate.
@@ -134,27 +140,38 @@ jobs:
       # issuing, which is worse than tracking upstream.
       - name: Install acme.sh
         if: steps.decide.outputs.issue == 'true'
+        env:
+          ACME_EMAIL: ${{ vars.ACME_EMAIL || 'noreply@skiprocking.ca' }}
         run: |
           set -euo pipefail
-          curl -s https://get.acme.sh | sh -s email=noreply@skiprocking.ca
+          curl -s https://get.acme.sh | sh -s email="$ACME_EMAIL"
           echo "$HOME/.acme.sh" >> "$GITHUB_PATH"
 
       # No acme.sh state survives between runs, so every issue makes a new key.
       # That is deliberate: a revoked or blocklisted key never comes back.
-      - name: Issue the certificate (DNS-01 through Porkbun)
+      - name: Load DNS keys
         if: steps.decide.outputs.issue == 'true'
         env:
+          DNS_CREDENTIALS: ${{ secrets.DNS_CREDENTIALS }}
           PORKBUN_API_KEY: ${{ secrets.PORKBUN_API_KEY }}
           PORKBUN_SECRET_API_KEY: ${{ secrets.PORKBUN_SECRET_API_KEY }}
+        run: ci/load_dns_credentials.sh
+
+      - name: Check Porkbun access
+        if: steps.decide.outputs.issue == 'true' && (vars.DNS_PLUGIN || 'dns_porkbun') == 'dns_porkbun'
+        env:
+          DOMAIN: ${{ vars.DOMAIN || 'skiprocking.ca' }}
+        run: ci/porkbun_preflight.sh "$DOMAIN"
+
+      - name: Issue the certificate (DNS-01)
+        if: steps.decide.outputs.issue == 'true'
+        env:
           NAME: ${{ steps.decide.outputs.name }}
           SERVER: ${{ steps.cfg.outputs.server }}
+          DNS_PLUGIN: ${{ vars.DNS_PLUGIN || 'dns_porkbun' }}
         run: |
           set -euo pipefail
-          if [ -z "$PORKBUN_API_KEY" ] || [ -z "$PORKBUN_SECRET_API_KEY" ]; then
-            echo "::error::PORKBUN_API_KEY / PORKBUN_SECRET_API_KEY are not set on this repo."
-            exit 1
-          fi
-          "$HOME/.acme.sh/acme.sh" --issue --dns dns_porkbun -d "$NAME" \
+          "$HOME/.acme.sh/acme.sh" --issue --dns "$DNS_PLUGIN" -d "$NAME" \
             --server "$SERVER" --keylength ec-256
           mkdir -p out
           "$HOME/.acme.sh/acme.sh" --install-cert -d "$NAME" --ecc \

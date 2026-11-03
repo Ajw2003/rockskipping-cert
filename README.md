@@ -24,3 +24,11 @@ the download URL never moves:
 - `server.key` — private key
 
 Renewed automatically by `.github/workflows/renew-cert.yml` in the game repository.
+
+## Using this as a template
+
+1. Press **Use this template** on GitHub to make your own copy. The copy must be public, so players' PCs can download the certificate without signing in (safe: the key is public by design, see above).
+2. In the copy's Settings > Secrets and variables > Actions, set the variables `DOMAIN` (your domain), `DNS_PLUGIN` (default `dns_porkbun`) and `ACME_EMAIL`, and the secret `DNS_CREDENTIALS` (one `KEY=value` line per key your DNS plugin needs).
+3. Press **Run workflow** on "Watch the pad certificate".
+
+A detailed guide is coming in DropMotion's `docs/setup/own-domain.md`.
